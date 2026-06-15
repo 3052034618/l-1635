@@ -188,7 +188,7 @@ class Reservation(Base):
     __tablename__ = "reservations"
     __table_args__ = (
         Index("idx_reservation_employee_date", "employee_id", "reservation_date"),
-        UniqueConstraint("schedule_id", "employee_id", name="uq_schedule_employee"),
+        Index("idx_reservation_schedule_employee", "schedule_id", "employee_id"),
     )
 
     id = Column(Integer, primary_key=True, index=True)

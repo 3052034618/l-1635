@@ -15,8 +15,77 @@ logger = logging.getLogger(__name__)
 
 
 class VehicleLocationService:
+    _last_push_state = {}
+
     def __init__(self, db: Session):
         self.db = db
+
+    def _should_push_location_update(
+        self, employee_id: int, schedule_id: int, station_id: int,
+        eta_min: float, now: datetime
+    ) -> bool:
+        key = f"{employee_id}_{schedule_id}_{station_id}"
+        state = self._last_push_state.get(key)
+
+        key_milestones = [30, 20, 15, 10, 5, 2, 1]
+        crossed_milestone = False
+        if state:
+            for m in key_milestones:
+                if state["last_eta"] > m >= eta_min:
+                    crossed_milestone = True
+                    break
+
+        if not state:
+            self._last_push_state[key] = {
+                "last_push": now,
+                "last_eta": eta_min,
+                "push_count": 1
+            }
+            return eta_min <= 30
+
+        time_since_last = (now - state["last_push"]).total_seconds()
+        eta_change = abs(state["last_eta"] - eta_min)
+
+        should_push = False
+        reason = ""
+
+        if crossed_milestone:
+            should_push = True
+            reason = f"跨越里程碑:{eta_min:.0f}分钟"
+        elif eta_min <= 30 and time_since_last >= 180 and eta_change >= 2:
+            should_push = True
+            reason = f"ETA变化{eta_change:.1f}分钟，间隔{time_since_last:.0f}秒"
+        elif eta_min <= 10 and time_since_last >= 120:
+            should_push = True
+            reason = f"临近到站，定时推送"
+        elif time_since_last >= 600:
+            should_push = True
+            reason = "10分钟心跳推送"
+
+        if should_push:
+            self._last_push_state[key] = {
+                "last_push": now,
+                "last_eta": eta_min,
+                "push_count": state["push_count"] + 1,
+                "last_reason": reason
+            }
+            logger.debug(
+                f"员工[{employee_id}]班次[{schedule_id}]站点[{station_id}] "
+                f"推送触发: {reason}, ETA={eta_min:.1f}min, 累计推送{state['push_count'] + 1}次"
+            )
+
+        return should_push
+
+    def _cleanup_old_push_state(self):
+        now = datetime.utcnow()
+        expired_keys = []
+        for key, state in self._last_push_state.items():
+            if (now - state["last_push"]).total_seconds() > 7200:
+                expired_keys.append(key)
+        for key in expired_keys:
+            del self._last_push_state[key]
+        if expired_keys:
+            logger.debug(f"清理过期推送状态: {len(expired_keys)} 条")
 
     def report_location(self, data: VehicleLocationCreate) -> Optional[VehicleLocation]:
         try:
@@ -166,44 +235,74 @@ class VehicleLocationService:
         eta_info = self.calculate_eta(location.schedule_id)
         stations_eta = eta_info.get("stations_eta", [])
         eta_by_station = {s["station_id"]: s for s in stations_eta}
+        now = datetime.utcnow()
+
+        self._cleanup_old_push_state()
+
+        from app.models import Notification
 
         for res in reservations:
             try:
                 station_eta = eta_by_station.get(res.station_id)
-                if not station_eta:
+                if not station_eta or station_eta["status"] != "upcoming":
                     continue
 
-                if station_eta["status"] == "upcoming":
-                    eta_min = station_eta["eta_minutes"]
-                    station_name = station_eta["station_name"]
-                    distance = station_eta["distance_km"]
+                eta_min = station_eta["eta_minutes"]
+                station_name = station_eta["station_name"]
+                distance = station_eta["distance_km"]
 
-                    should_notify = (
-                        eta_min <= 30 or
-                        (hasattr(res, '_last_notified_min') and abs(res._last_notified_min - eta_min) >= 5)
+                if not self._should_push_location_update(
+                    res.employee_id, location.schedule_id, res.station_id, eta_min, now
+                ):
+                    continue
+
+                old_pos_notifs = self.db.query(Notification).filter(
+                    Notification.employee_id == res.employee_id,
+                    Notification.type == "vehicle_position_updated",
+                    Notification.related_id == location.schedule_id,
+                    Notification.related_type == "schedule"
+                ).all()
+                if len(old_pos_notifs) >= 3:
+                    old_pos_notifs_sorted = sorted(
+                        old_pos_notifs, key=lambda n: n.created_at
                     )
-                    if not hasattr(res, '_last_notified_min') or should_notify:
-                        notification_service.create_notification(
-                            self.db,
-                            type="vehicle_position_updated",
-                            employee_id=res.employee_id,
-                            title="班车位置更新",
-                            content=f"班车距离 {station_name} 还有 {distance} 公里，预计 {eta_min} 分钟到达",
-                            related_id=location.schedule_id,
-                            related_type="schedule",
-                            extra={
-                                "schedule_id": location.schedule_id,
-                                "station_id": res.station_id,
-                                "station_name": station_name,
-                                "eta_minutes": eta_min,
-                                "distance_km": distance,
-                                "position": {
-                                    "latitude": location.latitude,
-                                    "longitude": location.longitude,
-                                    "speed": location.speed
-                                }
-                            }
-                        )
+                    for n in old_pos_notifs_sorted[:-2]:
+                        self.db.delete(n)
+                    self.db.flush()
+
+                if eta_min <= 1:
+                    content = f"班车即将到达 {station_name}，请做好乘车准备"
+                    title = "班车即将到站"
+                elif eta_min <= 5:
+                    content = f"班车距离 {station_name} 还有 {distance:.1f} 公里，预计 {eta_min:.0f} 分钟到达"
+                    title = "班车即将到站"
+                else:
+                    content = f"班车距离 {station_name} 还有 {distance:.1f} 公里，预计 {eta_min:.0f} 分钟到达"
+                    title = "班车位置更新"
+
+                notification_service.create_notification(
+                    self.db,
+                    type="vehicle_position_updated",
+                    employee_id=res.employee_id,
+                    title=title,
+                    content=content,
+                    related_id=location.schedule_id,
+                    related_type="schedule",
+                    extra={
+                        "schedule_id": location.schedule_id,
+                        "station_id": res.station_id,
+                        "station_name": station_name,
+                        "eta_minutes": round(eta_min, 1),
+                        "distance_km": round(distance, 2),
+                        "position": {
+                            "latitude": location.latitude,
+                            "longitude": location.longitude,
+                            "speed": location.speed
+                        },
+                        "push_time": now.isoformat()
+                    }
+                )
+
             except Exception as e:
                 logger.warning(f"通知员工[{res.employee_id}]位置更新失败: {e}")
                 continue

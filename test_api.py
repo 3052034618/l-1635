@@ -12,6 +12,7 @@ from app.models import (
     Schedule, ScheduleStatus, Reservation, ReservationStatus,
     Notification, SeatLock
 )
+from app.services.vehicle_location import VehicleLocationService
 from passlib.context import CryptContext
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -430,3 +431,214 @@ def test_get_employee_notifications(setup_test_data):
     notifs = response.json()
     assert isinstance(notifs, list)
     assert len(notifs) >= 1
+
+
+def test_schedules_list_with_stats_and_filter(setup_test_data):
+    """需求1：班次列表返回余座统计，支持status筛选不报错"""
+    data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
+    client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+
+    response = client.get("/api/v1/schedules")
+    assert response.status_code == 200
+    schedules = response.json()
+    assert isinstance(schedules, list)
+    assert len(schedules) > 0
+
+    for s in schedules:
+        assert "reserved_count" in s
+        assert "available_seats" in s
+        assert isinstance(s["reserved_count"], int)
+        assert isinstance(s["available_seats"], int)
+        assert s["reserved_count"] + s["available_seats"] <= data["vehicle"].capacity
+
+    response_pending = client.get("/api/v1/schedules?status=pending")
+    assert response_pending.status_code == 200
+    pending_schedules = response_pending.json()
+    assert all(s["status"] == "pending" for s in pending_schedules)
+
+    response_invalid = client.get("/api/v1/schedules?status=invalid_status")
+    assert response_invalid.status_code == 200
+    invalid_schedules = response_invalid.json()
+    assert len(invalid_schedules) >= len(pending_schedules)
+
+    response_route = client.get(f"/api/v1/schedules?route_id={data['route'].id}")
+    assert response_route.status_code == 200
+    route_schedules = response_route.json()
+    assert all(s["route_id"] == data["route"].id for s in route_schedules)
+
+
+def test_cancel_and_rebook_same_schedule(setup_test_data):
+    """需求2：取消后重新预约同一班次成功，通知各保留一条"""
+    data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
+    response1 = client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+    assert response1.status_code == 200
+    result1 = response1.json()
+    assert result1["success"] == True
+    res_id = result1["reservation"]["id"]
+    available_after_first = result1["available_seats_after"]
+
+    db = TestingSessionLocal()
+    try:
+        notifs_after_book = db.query(Notification).filter(
+            Notification.employee_id == emp.id,
+            Notification.type.in_(["reservation_confirmed", "reservation_cancelled"])
+        ).all()
+        confirmed_count = sum(1 for n in notifs_after_book if n.type == "reservation_confirmed")
+        assert confirmed_count >= 1
+    finally:
+        db.close()
+
+    response_cancel = client.delete(f"/api/v1/reservations/{res_id}?employee_id={emp.id}")
+    assert response_cancel.status_code == 200
+    assert response_cancel.json()["success"] == True
+
+    db = TestingSessionLocal()
+    try:
+        notifs_after_cancel = db.query(Notification).filter(
+            Notification.employee_id == emp.id,
+            Notification.type.in_(["reservation_confirmed", "reservation_cancelled"])
+        ).all()
+        cancel_count = sum(1 for n in notifs_after_cancel if n.type == "reservation_cancelled")
+        assert cancel_count >= 1
+    finally:
+        db.close()
+
+    response2 = client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+    assert response2.status_code == 200
+    result2 = response2.json()
+    assert result2["success"] == True
+    assert result2["schedule"]["id"] == data["schedule"].id
+
+    db = TestingSessionLocal()
+    try:
+        notifs_final = db.query(Notification).filter(
+            Notification.employee_id == emp.id,
+            Notification.type.in_(["reservation_confirmed", "reservation_cancelled"])
+        ).order_by(Notification.created_at).all()
+
+        confirmed_notifs = [n for n in notifs_final if n.type == "reservation_confirmed"]
+        cancel_notifs = [n for n in notifs_final if n.type == "reservation_cancelled"]
+
+        assert len(confirmed_notifs) >= 1
+        assert len(cancel_notifs) >= 1
+
+        total_notifs = len(confirmed_notifs) + len(cancel_notifs)
+        assert total_notifs <= 3
+
+        latest_confirmed = max(confirmed_notifs, key=lambda n: n.created_at)
+        assert "重新预约" in latest_confirmed.title or "预约成功" in latest_confirmed.title
+
+        res = db.query(Reservation).filter(
+            Reservation.schedule_id == data["schedule"].id,
+            Reservation.employee_id == emp.id,
+            Reservation.status == ReservationStatus.CONFIRMED
+        ).first()
+        assert res is not None
+        assert res.id == result2["reservation"]["id"]
+    finally:
+        db.close()
+
+
+def test_location_report_no_duplicate_push(setup_test_data):
+    """需求3：连续上报位置，通知列表不重复刷屏"""
+    data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
+    client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+
+    db = TestingSessionLocal()
+    try:
+        initial_notifs = db.query(Notification).filter(
+            Notification.employee_id == emp.id,
+            Notification.type == "vehicle_position_updated"
+        ).count()
+    finally:
+        db.close()
+
+    VehicleLocationService._last_push_state = {}
+
+    for i in range(5):
+        response = client.post(
+            "/api/v1/vehicle-locations/report",
+            json={
+                "vehicle_id": data["vehicle"].id,
+                "schedule_id": data["schedule"].id,
+                "latitude": 31.0 + i * 0.001,
+                "longitude": 121.0 + i * 0.001,
+                "speed": 40.0
+            }
+        )
+        assert response.status_code == 200
+
+    db = TestingSessionLocal()
+    try:
+        pos_notifs = db.query(Notification).filter(
+            Notification.employee_id == emp.id,
+            Notification.type == "vehicle_position_updated"
+        ).all()
+        new_notifs_count = len(pos_notifs) - initial_notifs
+
+        assert new_notifs_count <= 3
+        assert new_notifs_count <= 5
+
+        for n in pos_notifs:
+            assert n.title in ["班车位置更新", "班车即将到站"]
+            assert n.related_id == data["schedule"].id
+    finally:
+        db.close()
+
+
+def test_schedules_list_does_not_500(setup_test_data):
+    """需求1：各种边界条件下列表接口不报错"""
+    response1 = client.get("/api/v1/schedules?status=completed")
+    assert response1.status_code == 200
+    assert isinstance(response1.json(), list)
+
+    response2 = client.get("/api/v1/schedules?route_id=999999")
+    assert response2.status_code == 200
+    assert isinstance(response2.json(), list)
+
+    from datetime import date
+    future_date = date.today().strftime("%Y-%m-%d")
+    response3 = client.get(f"/api/v1/schedules?start_date={future_date}")
+    assert response3.status_code == 200
+    assert isinstance(response3.json(), list)
+
+    response4 = client.get("/api/v1/schedules?status=pending&status=active")
+    assert response4.status_code == 200
+    assert isinstance(response4.json(), list)

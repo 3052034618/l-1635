@@ -233,20 +233,34 @@ class ReservationService:
                     "alternatives": alternatives
                 }
 
-            existing_res = self.db.query(Reservation).filter(
+            existing_confirmed = self.db.query(Reservation).filter(
                 Reservation.schedule_id == selected.id,
                 Reservation.employee_id == request.employee_id,
                 Reservation.status.in_([ReservationStatus.CONFIRMED])
             ).first()
-            if existing_res:
+            if existing_confirmed:
                 selected_lock.is_active = False
                 self.db.commit()
                 return {
                     "success": False,
                     "message": "您已预约该班次",
-                    "reservation": existing_res,
+                    "reservation": existing_confirmed,
                     "schedule": selected
                 }
+
+            old_cancelled = self.db.query(Reservation).filter(
+                Reservation.schedule_id == selected.id,
+                Reservation.employee_id == request.employee_id,
+                Reservation.status == ReservationStatus.CANCELLED
+            ).all()
+            old_cancelled_ids = [r.id for r in old_cancelled]
+            is_rebooking = len(old_cancelled) > 0
+
+            if is_rebooking:
+                for r in old_cancelled:
+                    r.status = ReservationStatus.CANCELLED
+                self.db.flush()
+                logger.info(f"员工[{request.employee_id}]重新预约班次[{selected.id}]，旧记录{len(old_cancelled)}条")
 
             reservation = Reservation(
                 schedule_id=selected.id,
@@ -266,18 +280,44 @@ class ReservationService:
 
             try:
                 route_name = selected.route.name if selected.route else "未知"
+                notif_title = "预约成功（重新预约）" if is_rebooking else "预约成功"
+                notif_content = (
+                    f"您已重新预约 {selected.departure_time.strftime('%Y-%m-%d %H:%M')} 的班车，线路：{route_name}"
+                    if is_rebooking
+                    else f"您已成功预约 {selected.departure_time.strftime('%Y-%m-%d %H:%M')} 的班车，线路：{route_name}"
+                )
+
+                if is_rebooking:
+                    from app.models import Notification
+                    existing_same_notifs = self.db.query(Notification).filter(
+                        Notification.employee_id == request.employee_id,
+                        Notification.type == "reservation_confirmed",
+                        Notification.related_type == "reservation",
+                        Notification.related_id != None
+                    ).all()
+                    same_schedule_notifs = [
+                        n for n in existing_same_notifs
+                        if n.related_id in old_cancelled_ids or n.content.find(selected.departure_time.strftime('%Y-%m-%d %H:%M')) >= 0
+                    ]
+                    if same_schedule_notifs:
+                        for n in same_schedule_notifs:
+                            self.db.delete(n)
+                        self.db.flush()
+                        logger.info(f"员工[{request.employee_id}]重新预约，清理旧通知{len(same_schedule_notifs)}条")
+
                 notification_service.create_notification(
                     self.db,
                     type="reservation_confirmed",
                     employee_id=request.employee_id,
-                    title="预约成功",
-                    content=f"您已成功预约 {selected.departure_time.strftime('%Y-%m-%d %H:%M')} 的班车，线路：{route_name}",
+                    title=notif_title,
+                    content=notif_content,
                     related_id=reservation.id,
                     related_type="reservation",
                     extra={
                         "schedule_id": selected.id,
                         "departure_time": selected.departure_time.isoformat(),
                         "route_name": route_name,
+                        "is_rebooking": is_rebooking,
                         "available_seats_after": self.get_available_seats(selected.id)
                     }
                 )
@@ -314,7 +354,30 @@ class ReservationService:
             if not reservation:
                 return False
 
+            if reservation.status == ReservationStatus.CANCELLED:
+                logger.info(f"预约[{reservation_id}]已为取消状态，无需重复取消")
+                return True
+
+            schedule_id = reservation.schedule_id
             reservation.status = ReservationStatus.CANCELLED
+            self.db.flush()
+
+            from app.models import Notification
+            old_cancel_notifs = self.db.query(Notification).filter(
+                Notification.employee_id == employee_id,
+                Notification.type == "reservation_cancelled",
+                Notification.related_type == "reservation"
+            ).all()
+            same_schedule_cancel = [
+                n for n in old_cancel_notifs
+                if (n.related_id is not None and n.related_id == reservation_id)
+            ]
+            if same_schedule_cancel:
+                for n in same_schedule_cancel:
+                    self.db.delete(n)
+                self.db.flush()
+                logger.info(f"清理重复取消通知{len(same_schedule_cancel)}条")
+
             self.db.commit()
 
             try:
@@ -325,10 +388,14 @@ class ReservationService:
                     type="reservation_cancelled",
                     employee_id=employee_id,
                     title="预约已取消",
-                    content=f"您预约的 {dep_time} 班车已取消",
+                    content=f"您预约的 {dep_time} 班车已取消，座位已释放",
                     related_id=reservation_id,
                     related_type="reservation",
-                    extra={"schedule_id": reservation.schedule_id}
+                    extra={
+                        "schedule_id": schedule_id,
+                        "departure_time": dep_time,
+                        "released_seat": True
+                    }
                 )
             except Exception as e:
                 logger.warning(f"发送取消预约通知失败（不影响取消结果）: {e}")
