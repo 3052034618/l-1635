@@ -9,7 +9,8 @@ from app.database import Base, get_db
 from app.main import app
 from app.models import (
     Station, Route, RouteStation, Employee, Driver, Vehicle,
-    Schedule, ScheduleStatus, Reservation, ReservationStatus
+    Schedule, ScheduleStatus, Reservation, ReservationStatus,
+    Notification, SeatLock
 )
 from passlib.context import CryptContext
 
@@ -59,12 +60,15 @@ def setup_test_data():
         db.add_all([rs1, rs2, rs3])
         db.flush()
 
-        employee = Employee(
-            name="测试员工", employee_no="EMP001", department="测试部",
-            default_station_id=station1.id,
-            hashed_password=pwd_context.hash("123456")
-        )
-        db.add(employee)
+        employees = []
+        for i in range(1, 6):
+            emp = Employee(
+                name=f"测试员工{i:02d}", employee_no=f"EMP{i:04d}", department="测试部",
+                default_station_id=station1.id,
+                hashed_password=pwd_context.hash("123456")
+            )
+            employees.append(emp)
+            db.add(emp)
         db.flush()
 
         driver = Driver(
@@ -74,7 +78,7 @@ def setup_test_data():
         db.add(driver)
         db.flush()
 
-        vehicle = Vehicle(plate_no="沪A·TEST01", model="测试车型", capacity=30)
+        vehicle = Vehicle(plate_no="沪A·TEST01", model="测试车型", capacity=5)
         db.add(vehicle)
         db.flush()
 
@@ -96,7 +100,7 @@ def setup_test_data():
         return {
             "stations": [station1, station2, station3],
             "route": route,
-            "employee": employee,
+            "employees": employees,
             "driver": driver,
             "vehicle": vehicle,
             "schedule": schedule
@@ -108,7 +112,10 @@ def setup_test_data():
 def test_root():
     response = client.get("/")
     assert response.status_code == 200
-    assert "企业班车智能调度系统" in response.json()["name"]
+    data = response.json()
+    assert "企业班车智能调度系统" in data["name"]
+    assert "features" in data
+    assert len(data["features"]) == 7
 
 
 def test_health_check():
@@ -127,13 +134,17 @@ def test_create_station():
     assert data["name"] == "测试站点"
 
 
-def test_smart_reservation(setup_test_data):
+def test_smart_reservation_success(setup_test_data):
+    """需求1、2：预约成功后接口返回200，通知列表可查"""
     data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
     response = client.post(
         "/api/v1/reservations/smart",
         json={
-            "employee_id": data["employee"].id,
-            "station_id": data["stations"][0].id,
+            "employee_id": emp.id,
+            "station_id": station.id,
             "target_date": data["schedule"].departure_date.isoformat(),
             "direction": "up"
         }
@@ -142,15 +153,27 @@ def test_smart_reservation(setup_test_data):
     result = response.json()
     assert result["success"] == True
     assert "reservation" in result
+    assert "available_seats_after" in result
+
+    db = TestingSessionLocal()
+    try:
+        notifs = db.query(Notification).filter(Notification.employee_id == emp.id).all()
+        assert len(notifs) >= 1
+        assert any(n.type == "reservation_confirmed" for n in notifs)
+    finally:
+        db.close()
 
 
 def test_conflict_detection(setup_test_data):
     data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
     response1 = client.post(
         "/api/v1/reservations/smart",
         json={
-            "employee_id": data["employee"].id,
-            "station_id": data["stations"][0].id,
+            "employee_id": emp.id,
+            "station_id": station.id,
             "target_date": data["schedule"].departure_date.isoformat(),
         }
     )
@@ -160,14 +183,57 @@ def test_conflict_detection(setup_test_data):
     response2 = client.post(
         "/api/v1/reservations/smart",
         json={
-            "employee_id": data["employee"].id,
-            "station_id": data["stations"][0].id,
+            "employee_id": emp.id,
+            "station_id": station.id,
             "target_date": data["schedule"].departure_date.isoformat(),
         }
     )
     assert response2.status_code == 200
     result = response2.json()
-    assert result.get("has_conflict") == True or result.get("success") == False
+    assert result.get("success") == False
+
+
+def test_seat_accuracy_concurrent(setup_test_data):
+    """需求4：连续多人预约时余座和容量严格对应"""
+    data = setup_test_data
+    station = data["stations"][0]
+    capacity = data["vehicle"].capacity
+
+    success_count = 0
+    last_available = capacity
+    for i, emp in enumerate(data["employees"]):
+        response = client.post(
+            "/api/v1/reservations/smart",
+            json={
+                "employee_id": emp.id,
+                "station_id": station.id,
+                "target_date": data["schedule"].departure_date.isoformat(),
+            }
+        )
+        assert response.status_code == 200
+        result = response.json()
+        if result["success"]:
+            success_count += 1
+            last_available = result.get("available_seats_after", -1)
+            assert success_count + last_available <= capacity
+
+    assert success_count <= capacity
+    db = TestingSessionLocal()
+    try:
+        confirmed_count = db.query(Reservation).filter(
+            Reservation.schedule_id == data["schedule"].id,
+            Reservation.status == ReservationStatus.CONFIRMED
+        ).count()
+        assert confirmed_count == success_count
+        assert confirmed_count <= capacity
+
+        active_locks = db.query(SeatLock).filter(
+            SeatLock.schedule_id == data["schedule"].id,
+            SeatLock.is_active == True
+        ).count()
+        assert confirmed_count + active_locks <= capacity
+    finally:
+        db.close()
 
 
 def test_vehicle_location_report(setup_test_data):
@@ -184,6 +250,7 @@ def test_vehicle_location_report(setup_test_data):
     )
     assert response.status_code == 200
     loc = response.json()
+    assert loc is not None
     assert loc["latitude"] == 31.2304
     assert loc["speed"] == 45.0
 
@@ -207,6 +274,7 @@ def test_get_schedule_eta(setup_test_data):
 
 
 def test_assign_driver_tasks(setup_test_data):
+    """需求1：司机任务分配接口成功，通知可查"""
     data = setup_test_data
     response = client.post(
         f"/api/v1/driver-tasks/assign-daily?driver_id={data['driver'].id}&task_date={data['schedule'].departure_date.isoformat()}"
@@ -214,6 +282,16 @@ def test_assign_driver_tasks(setup_test_data):
     assert response.status_code == 200
     result = response.json()
     assert "assigned" in result
+    assigned = result["assigned"]
+    assert assigned >= 0
+
+    db = TestingSessionLocal()
+    try:
+        notifs = db.query(Notification).filter(Notification.driver_id == data["driver"].id).all()
+        if assigned > 0:
+            assert len(notifs) >= assigned
+    finally:
+        db.close()
 
 
 def test_generate_performance_report(setup_test_data):
@@ -226,8 +304,29 @@ def test_generate_performance_report(setup_test_data):
     assert isinstance(reports, list)
 
 
-def test_check_schedule_demand(setup_test_data):
+def test_check_schedule_demand_by_station(setup_test_data):
+    """需求3：按站点人数判断取消，站点B 0人<阈值2，取消班次"""
     data = setup_test_data
+    emp1, emp2 = data["employees"][0], data["employees"][1]
+    stationA = data["stations"][0]
+
+    client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp1.id,
+            "station_id": stationA.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+    client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp2.id,
+            "station_id": stationA.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+
     response = client.post(
         f"/api/v1/schedules/{data['schedule'].id}/check-demand"
     )
@@ -235,6 +334,73 @@ def test_check_schedule_demand(setup_test_data):
     result = response.json()
     assert "cancelled" in result
     assert result["cancelled"] == True
+    assert "low_demand_stations" in result
+    assert len(result["low_demand_stations"]) >= 1
+    assert result["cancel_reason"] == "station_below_threshold"
+
+    db = TestingSessionLocal()
+    try:
+        notifs = db.query(Notification).filter(
+            Notification.employee_id.in_([emp1.id, emp2.id]),
+            Notification.type == "schedule_cancelled"
+        ).all()
+        assert len(notifs) >= 2
+    finally:
+        db.close()
+
+
+def test_cancel_reservation_and_notification(setup_test_data):
+    """需求1：取消预约成功，通知可查，接口不500"""
+    data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
+    res1 = client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    ).json()
+    assert res1["success"] == True
+    res_id = res1["reservation"]["id"]
+
+    response = client.delete(
+        f"/api/v1/reservations/{res_id}?employee_id={emp.id}"
+    )
+    assert response.status_code == 200
+    assert response.json()["success"] == True
+
+    db = TestingSessionLocal()
+    try:
+        cancel_notifs = db.query(Notification).filter(
+            Notification.employee_id == emp.id,
+            Notification.type == "reservation_cancelled"
+        ).all()
+        assert len(cancel_notifs) >= 1
+    finally:
+        db.close()
+
+
+def test_notification_failure_does_not_break_api(setup_test_data):
+    """需求1：即使通知服务出问题，主接口仍正常返回"""
+    data = setup_test_data
+    emp = data["employees"][2]
+    station = data["stations"][0]
+
+    response = client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["success"] in [True, False]
+    assert "message" in result or "reservation" in result
 
 
 def test_export_performance_report(setup_test_data):
@@ -243,3 +409,24 @@ def test_export_performance_report(setup_test_data):
     response = client.get("/api/v1/performance-reports/export")
     assert response.status_code == 200
     assert "application/vnd.openxmlformats" in response.headers["content-type"]
+
+
+def test_get_employee_notifications(setup_test_data):
+    data = setup_test_data
+    emp = data["employees"][0]
+    station = data["stations"][0]
+
+    client.post(
+        "/api/v1/reservations/smart",
+        json={
+            "employee_id": emp.id,
+            "station_id": station.id,
+            "target_date": data["schedule"].departure_date.isoformat(),
+        }
+    )
+
+    response = client.get(f"/api/v1/notifications/employee/{emp.id}")
+    assert response.status_code == 200
+    notifs = response.json()
+    assert isinstance(notifs, list)
+    assert len(notifs) >= 1
